@@ -10,6 +10,10 @@ import java.sql.*;
 import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.ConcurrentLinkedQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -19,23 +23,41 @@ public class WebCrawler {
     private Set<String> visitedURLs; // Set of already visited URLs
     private Map<String, EmailRecord> emailsToWriteToDB; // Map of emails to write to DB being temp stored before writing
     private Set<String> uniqueEmails; // Set of unique emails found even already written to DB for easy checks
-    private static int emailCount = 0; // counter for emails to log them as I get them
+    private static AtomicInteger emailCount = new AtomicInteger(0); // counter for emails to log them as I get them
+
+    //set up multithreading
+    private final ExecutorService threadPool;
+    private final int numThreads;
+    private final AtomicInteger threadsRunning = new AtomicInteger(0);
+    private volatile boolean stopCrawling = false;
+
 
     //Start
     private final String startingURL = "https://www.touro.edu/"; // Default starting URL, can be changed
     private static final int EMAIL_BATCH = 500; // write to DB in batches of 500 emails
+    private final int TARGET_EMAILS = 10_000;
 
     //DB connection and regex for emails
     private Connection dbConnectionUrl; // Connection to the database
     private Pattern emailRegexPattern; // Regex pattern for matching emails
 
-    public void crawl() throws SQLException, IOException {
-        //initialize our DSs
-        URLsToVisit = new ConcurrentLinkedQueue<>(); //should behave like a queue, but also keep insertion order
-        visitedURLs = new HashSet<>();
-        emailsToWriteToDB = new HashMap<>();
-        uniqueEmails = new HashSet<>();
+    private final Object dbLock = new Object();
+    private final Object emailLock = new Object();
 
+    public WebCrawler(int numThreads) {
+        this.numThreads = numThreads;
+        this.threadPool = Executors.newFixedThreadPool(numThreads);
+
+        //initialize the threadsafe DSs
+        URLsToVisit = new ConcurrentLinkedQueue<>(); //should behave like a queue, but also keep insertion order
+        visitedURLs = Collections.synchronizedSet(new HashSet<>());
+        emailsToWriteToDB = Collections.synchronizedMap(new HashMap<>());
+        uniqueEmails = Collections.synchronizedSet(new HashSet<>());
+
+        System.out.println("Webcrawler with " + numThreads);
+    }
+
+    public void crawl() throws SQLException, IOException {
         // Set the email regex pattern
         emailRegexPattern = Pattern.compile("[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\\.[A-Za-z]{2,}");
 
@@ -45,41 +67,144 @@ public class WebCrawler {
         //start crawling from the starting URL
         URLsToVisit.offer(startingURL);
 
-        //main loop we use to crawl the webpages
-        while (!URLsToVisit.isEmpty()) {
-            String currentURL = URLsToVisit.poll(); //get the next url to visit
+        //create threads
+        for (int i = 0; i < numThreads; i++) {
+            // number threads for logging
+            final int workerNum = i + 1;
+            threadPool.submit(() -> {
+                System.out.println("Thread #:" + workerNum + ", started.");
+                threadsRunning.incrementAndGet();
 
-            //skip if already visited
-            if (visitedURLs.contains(currentURL)) {
-                continue;
+                try {
+                    while (!stopCrawling && emailCount.get() < TARGET_EMAILS) {
+                        String currentURL = null;
+
+                        try {
+                            //get URLs from the queue
+                            currentURL = URLsToVisit.poll();
+
+                            if (currentURL == null) {
+                                //if nothing to get then wait
+                                Thread.sleep(30000); // wait for 1 second before checking again
+                                continue;
+                            }
+
+                            if (!visitedURLs.add(currentURL)) {
+                                // if the URL was already visited, skip it
+                                continue;
+                            }
+
+                            System.out.println("Thread #" + workerNum + " visiting: " + currentURL);
+
+                            //get the webpage
+                            Document webPage = Jsoup.connect(currentURL).timeout(60000).get();
+
+                            //get all the links on the current page
+                            getAndQueueNewLinks(webPage);
+
+                            //get all the emails on the current page
+                            getAndStoreEmails(webPage, currentURL);
+                        } catch (IOException e) {
+                            //log the error and continue
+                            System.err.println("Thread #: " + workerNum + ". Error fetching URL: " + currentURL + " - " + e.getMessage());
+                        } catch (SQLException e) {
+                            //log the error and continue
+                            System.err.println("Thread #: " + workerNum + ". DB error: " + e.getMessage());
+                        } catch (InterruptedException e) {
+                            // if interrupted, stop crawling
+                            Thread.currentThread().interrupt();
+                            //stop right away
+                            break;
+                        }
+
+                        // Check if we need reached the email target
+                        if (emailCount.get() >= TARGET_EMAILS) {
+                            System.out.println("Thread #" + workerNum + " reached the target: " + TARGET_EMAILS + " emails.");
+                            stopCrawling = true;
+                            break;
+                        }
+                    }
+                } finally {
+                    threadsRunning.decrementAndGet();
+                    System.out.println("Thread #" + workerNum + " finished.");
+                }
+            });
+        }
+
+        //monitor the threads
+        monitorThreads();
+        //shutdown
+        shutdown();
+    }
+
+    private void shutdown() throws SQLException {
+        System.out.println("Shutting down crawler...");
+
+        stopCrawling = true;
+        threadPool.shutdown();
+
+        try {
+            if (!threadPool.awaitTermination(30, TimeUnit.SECONDS)) {
+                threadPool.shutdownNow();
+                if (!threadPool.awaitTermination(10, TimeUnit.SECONDS)) {
+                    System.err.println("Thread pool didn't stop");
+                }
             }
+        } catch (InterruptedException e) {
+            threadPool.shutdownNow();
+            Thread.currentThread().interrupt();
+        }
 
-            //add to the visited URLs set
-            visitedURLs.add(currentURL);
-
-            try {
-                //get the webpage
-                Document webPage = Jsoup.connect(currentURL).timeout(60000).get();
-
-                //get all the links on the current page
-                getAndQueueNewLinks(webPage//,currentURL
-                         );
-
-                //get all the emails on the current page
-                getAndStoreEmails(webPage, currentURL);
-
-            } catch (IOException e) {
-                //log the error and continue
-                System.err.println("Error fetching URL: " + currentURL + " - " + e.getMessage());
+        // Write any remaining emails to database
+        synchronized (dbLock) {
+            if (!emailsToWriteToDB.isEmpty()) {
+                writeEmailsToDB();
             }
+        }
+
+        System.out.println("Crawling completed. Total emails found: " + emailCount.get());
+    }
+
+    private void monitorThreads() {
+        try {
+            while (threadsRunning.get() > 0 && !stopCrawling && emailCount.get() < TARGET_EMAILS) {
+                //check every 5 secs
+                Thread.sleep(10000);
+
+                System.out.println("Progress: " + emailCount.get() + " emails found, " +
+                                 visitedURLs.size() + " URLs visited, " +
+                                 URLsToVisit.size() + " URLs queued, " +
+                                 threadsRunning.get() + " threads running");
+
+                //check if threads aren't doing anything and no more URLs to visit
+                if (URLsToVisit.isEmpty() && threadsRunning.get() > 0) {
+                    //wait to see if we get more URLs
+                    Thread.sleep(10_000);
+                    //if still no URLs to visit, we can stop crawling
+                    if (URLsToVisit.isEmpty()) {
+                        System.out.println("No more URLs to visit. Stopping...");
+                        stopCrawling = true;
+                    }
+                }
+            }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            System.out.println("Monitoring interrupted, stopping crawling.");
         }
     }
 
     private void writeEmailsToDB() throws SQLException {
         String insertQuery = "INSERT INTO Emails (emailAddress, source, timeStamp) VALUES (?, ?, ?)";
         try (PreparedStatement statement = dbConnectionUrl.prepareStatement(insertQuery)) {
+            int batchSize = 0; // to keep track of the batch size
+
             // batch the emails to write to DB
             for (Map.Entry<String, EmailRecord> entry : emailsToWriteToDB.entrySet()) {
+                if (batchSize >= EMAIL_BATCH) {
+                    //stop if we reached the batch size
+                    break;
+                }
+
                 String emailAddress = entry.getKey();
                 EmailRecord emailRecord = entry.getValue();
 
@@ -90,16 +215,17 @@ public class WebCrawler {
 
                 // add to the batch
                 statement.addBatch();
-
-
+                batchSize++;
             }
             // put the batch in the DB
             statement.executeBatch();
+            System.out.println("Inserted " + batchSize + " emails into the database.");
 
             // add to the unique emails set
-            uniqueEmails.addAll(emailsToWriteToDB.keySet());
+            //uniqueEmails.addAll(emailsToWriteToDB.keySet());
             // clear the emails to write to DB map
             emailsToWriteToDB.clear();
+
         }
 
     }
@@ -115,35 +241,42 @@ public class WebCrawler {
             // get the email and convert to lowercase so that we can check them
             String foundEmail = emailMatcher.group().toLowerCase();
 
-            //first check if it's in our unique emails set
-            if (uniqueEmails.contains(foundEmail) || emailsToWriteToDB.containsKey(foundEmail)) {
-                // if it is, we skip it
-                continue;
+            //threadsafe check for the email
+            synchronized (emailLock) {
+                //first check if it's in our unique emails set
+                if (uniqueEmails.contains(foundEmail) || emailsToWriteToDB.containsKey(foundEmail)) {
+                    // if it is, we skip it
+                    continue;
+                }
+
+                //if we got here, it means we have a new email
+                LocalDateTime timestamp = LocalDateTime.now();
+                //create a new EmailRecord object
+                EmailRecord emailRecord = new EmailRecord(foundEmail, currentURL, timestamp);
+                //add it to our emails to write to DB map
+                emailsToWriteToDB.put(foundEmail, emailRecord);
+
+                //add to the unique emails set
+                uniqueEmails.add(foundEmail);
+
+                if (emailCount.get() >= TARGET_EMAILS) {
+                    stopCrawling = true; //everyone stops
+                }
             }
-
-            //added to previous check, so commenting out
-            //now we check if it is in our temp emails map
-//            if (emailsToWriteToDB.containsKey(foundEmail)) {
-//                //if it is, we skip it
-//                continue;
-//            }
-
-            //if we got here, it means we have a new email
-            LocalDateTime timestamp = LocalDateTime.now();
-            //create a new EmailRecord object
-            EmailRecord emailRecord = new EmailRecord(foundEmail, currentURL, timestamp);
-            //add it to our emails to write to DB map
-            emailsToWriteToDB.put(foundEmail, emailRecord);
 
             //log it
             System.out.println("Found new email: " + foundEmail + " on page: " + currentURL +
-                    "| Emails found: " + ++emailCount);
+                    "| Emails found: " + emailCount.incrementAndGet());
 
-            // Check if we need to write emails to the database
+            // Check if we reached the target number of emails
             if (emailsToWriteToDB.size() >= EMAIL_BATCH) {
-                writeEmailsToDB();
+                //Write to db right away
+                synchronized (dbLock) {
+                    writeEmailsToDB();
+                }
             }
         }
+
     }
 
     private void getAndQueueNewLinks(Document webPage//, String currentURL
@@ -153,10 +286,11 @@ public class WebCrawler {
         for (Element link : links) {
             String linkURL = link.absUrl("href"); // Get the absolute URL
 
-            // add the link to the queue if it is not already visited or in our queue
-            if ((linkURL.startsWith("http://") || linkURL.startsWith("https://"))
-                    && !visitedURLs.contains(linkURL) && !URLsToVisit.contains(linkURL)) {
-                URLsToVisit.offer(linkURL);
+            synchronized (visitedURLs) {
+                // add the link to the queue if it is not already visited or in our queue
+                if (linkURL.startsWith("https://") && !visitedURLs.contains(linkURL) && !URLsToVisit.contains(linkURL)) {
+                    URLsToVisit.offer(linkURL);
+                }
             }
         }
     }
@@ -178,13 +312,12 @@ public class WebCrawler {
                         + "encrypt=true;"
                         + "trustServerCertificate=true;"
                         + "loginTimeout=30;";
-        try { //(Connection connection = DriverManager.getConnection(connectionUrl);
-             //Statement statement = connection.createStatement()) {
+        try {
             dbConnectionUrl = DriverManager.getConnection(connectionUrl);
             System.out.println("Connected to the database successfully.");
 
         } catch (SQLException e) {
-            e.printStackTrace();
+            throw new RuntimeException("DB connection failed: " + e.getMessage());
         }
     }
 }
